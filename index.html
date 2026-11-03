@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gridiron Live</title>
+<style>
+  :root { --bg:#0b1020; --card:#151b2e; --line:#26304d; --fg:#e8ecf7; --muted:#8a94b3; --live:#ef4444; --win:#4ade80; --gold:#facc15; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.35 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  header { position:sticky; top:0; z-index:1; display:flex; gap:8px; align-items:center; padding:10px 12px; background:#0b1020ee; border-bottom:1px solid var(--line); }
+  header h1 { font-size:16px; margin:0; flex:1; }
+  button { font:inherit; color:var(--fg); background:#2a3558; border:0; border-radius:8px; padding:6px 10px; cursor:pointer; }
+  button.primary { background:#2563eb; }
+  button:disabled { opacity:.5; cursor:default; }
+  main { padding:10px 12px 24px; }
+  h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:16px 0 8px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px; margin-bottom:8px; }
+  .game .row { display:flex; align-items:center; gap:8px; }
+  .team { display:flex; align-items:center; gap:6px; flex:1; }
+  .team img { width:22px; height:22px; }
+  .score { font-weight:700; font-variant-numeric:tabular-nums; min-width:24px; text-align:right; }
+  .lead { color:var(--win); }
+  .meta { display:flex; justify-content:space-between; align-items:center; margin-top:6px; color:var(--muted); font-size:12px; gap:8px; }
+  .live { color:var(--live); font-weight:700; }
+  .poss::after { content:" 🏈"; font-size:11px; }
+  .big { display:flex; justify-content:space-around; align-items:center; text-align:center; }
+  .big img { width:44px; height:44px; }
+  .big .score { font-size:32px; min-width:0; text-align:center; }
+  .situation { text-align:center; color:var(--gold); margin-top:6px; }
+  .play { display:grid; grid-template-columns:62px 1fr; gap:8px; padding:7px 0; border-bottom:1px solid var(--line); }
+  .play:last-child { border-bottom:0; }
+  .play .clock { color:var(--muted); font-size:12px; font-variant-numeric:tabular-nums; }
+  .play.scoring { background:#facc1514; }
+  .play.scoring .text { color:var(--gold); font-weight:600; }
+  .drive { color:var(--muted); font-size:12px; padding:8px 0 2px; font-weight:600; }
+  .scorer { display:grid; grid-template-columns:22px 32px 1fr auto; gap:8px; align-items:center; padding:5px 0; }
+  .scorer img { width:32px; height:32px; border-radius:50%; background:#222b45; object-fit:cover; }
+  .scorer .pts { font-weight:700; color:var(--gold); font-variant-numeric:tabular-nums; }
+  .scorer small { color:var(--muted); display:block; }
+  .tabs { display:flex; gap:6px; margin-top:10px; }
+  .tabs button[aria-pressed="true"] { background:#2563eb; }
+  .muted { color:var(--muted); }
+  .err { color:var(--live); }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">Gridiron Live</h1>
+  <button id="back" hidden>All games</button>
+</header>
+<main id="main"><p class="muted">Loading scores…</p></main>
+<script>
+'use strict';
+const API = 'https://site.api.espn.com/apis/site/v2/sports/football/nfl';
+const SCAPE = 'https://scape.wtf';
+const main = document.getElementById('main');
+const title = document.getElementById('title');
+const back = document.getElementById('back');
+
+/* ---------- state ---------- */
+let port = null, actions = [], pinned = '', viewing = new URLSearchParams(location.search).get('game') || '';
+let tab = 'plays', timer = 0, request = 0, pending = false;
+let board = null;                 // last scoreboard
+const summaries = new Map();      // gameId -> {at, data}
+
+/* ---------- Scape bridge (remote site: wrapper sits between us and Scape) ---------- */
+window.addEventListener('message', event => {
+  const d = event.data;
+  if (event.source !== window.parent.parent || event.origin !== SCAPE) return;
+  if (d?.protocol !== 'scape.web.v1' || d.type !== 'connect' || event.ports.length !== 1) return;
+  port?.close();
+  port = event.ports[0];
+  port.onmessage = ({ data }) => {
+    if (data?.protocol !== 'scape.web.v1') return;
+    if (data.type === 'context') {
+      actions = Array.isArray(data.actions) ? data.actions : [];
+      const g = typeof data.data?.gameId === 'string' ? data.data.gameId : '';
+      if (g !== pinned) { pinned = g; viewing = g; }
+      refresh();
+    }
+    if (data.type === 'result') { pending = false; if (!data.ok) flash(data.error || 'Scape rejected that.'); render(); }
+  };
+  port.start();
+});
+window.addEventListener('keydown', e => { if (e.key === 'Escape') port?.postMessage({ protocol: 'scape.web.v1', type: 'close' }); });
+
+function pin(game) {
+  if (!port || !actions.includes('pick')) { viewing = game.id; refresh(); return; }
+  pending = true; render();
+  port.postMessage({ protocol: 'scape.web.v1', type: 'action', id: 'pick-' + (++request), name: 'pick',
+    payload: { gameId: game.id, label: game.shortName } });
+}
+
+/* ---------- data ---------- */
+const getJSON = async url => { const r = await fetch(url, { cache: 'no-store' }); if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); };
+async function summary(id, maxAgeMs) {
+  const hit = summaries.get(id);
+  if (hit && Date.now() - hit.at < maxAgeMs) return hit.data;
+  const data = await getJSON(`${API}/summary?event=${encodeURIComponent(id)}`);
+  summaries.set(id, { at: Date.now(), data });
+  return data;
+}
+
+/* PPR fantasy points from an ESPN boxscore. */
+function fantasy(box) {
+  const players = new Map();
+  const n = v => Number(String(v).split('/')[0]) || 0;
+  const add = (team, a, pts) => {
+    const id = a.athlete.id;
+    const p = players.get(id) || { id, name: a.athlete.displayName, team: team.abbreviation, img: a.athlete.headshot?.href, pts: 0, line: [] };
+    p.pts += pts; players.set(id, p); return p;
+  };
+  for (const side of box?.players || []) for (const cat of side.statistics) {
+    const L = cat.labels, at = k => L.indexOf(k);
+    for (const a of cat.athletes) {
+      const s = a.stats;
+      switch (cat.name) {
+        case 'passing': { const p = add(side.team, a, n(s[at('YDS')]) * 0.04 + n(s[at('TD')]) * 4 - n(s[at('INT')]) * 2); p.line.push(`${s[at('YDS')]} pass yds, ${s[at('TD')]} TD`); break; }
+        case 'rushing': { const p = add(side.team, a, n(s[at('YDS')]) * 0.1 + n(s[at('TD')]) * 6); p.line.push(`${s[at('YDS')]} rush yds${n(s[at('TD')]) ? `, ${s[at('TD')]} TD` : ''}`); break; }
+        case 'receiving': { const p = add(side.team, a, n(s[at('REC')]) + n(s[at('YDS')]) * 0.1 + n(s[at('TD')]) * 6); p.line.push(`${s[at('REC')]}-${s[at('YDS')]} rec${n(s[at('TD')]) ? `, ${s[at('TD')]} TD` : ''}`); break; }
+        case 'fumbles': add(side.team, a, -2 * n(s[at('LOST')])); break;
+        case 'kickReturns': case 'puntReturns': add(side.team, a, 6 * n(s[at('TD')])); break;
+        case 'kicking': { const p = add(side.team, a, 3 * n(s[at('FG')]) + n(s[at('XP')])); p.line.push(`FG ${s[at('FG')]}, XP ${s[at('XP')]}`); break; }
+      }
+    }
+  }
+  return [...players.values()].filter(p => p.pts !== 0);
+}
+
+/* ---------- DOM helpers (textContent only; never HTML from data) ---------- */
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+function img(src, alt) { const i = el('img'); i.alt = alt || ''; i.loading = 'lazy'; if (src) i.src = src; return i; }
+let flashMsg = '';
+function flash(m) { flashMsg = m; setTimeout(() => { flashMsg = ''; render(); }, 4000); }
+
+const awayHome = list => ['away', 'home'].map(side => list.find(t => t.homeAway === side)).filter(Boolean);
+/* ---------- views ---------- */
+function gameCard(ev) {
+  const c = ev.competitions[0], st = ev.status.type, live = st.state === 'in';
+  const card = el('div', 'card game');
+  const teams = awayHome(c.competitors);
+  const top = Math.max(...teams.map(t => Number(t.score) || 0));
+  for (const t of teams) {
+    const row = el('div', 'row');
+    const team = el('div', 'team');
+    team.append(img(t.team.logo, t.team.abbreviation));
+    const name = el('span', c.situation?.possession === t.team.id && live ? 'poss' : '', t.team.displayName);
+    team.append(name);
+    row.append(team, el('span', 'score' + (st.state !== 'pre' && Number(t.score) === top ? ' lead' : ''), st.state === 'pre' ? '' : t.score));
+    card.append(row);
+  }
+  const meta = el('div', 'meta');
+  const left = el('span', live ? 'live' : '', live ? `● ${st.shortDetail}` : st.shortDetail);
+  meta.append(left);
+  if (live && c.situation?.downDistanceText) meta.append(el('span', '', c.situation.downDistanceText));
+  const btn = el('button', live ? 'primary' : '', pinned ? 'View' : port && actions.includes('pick') ? 'Put on this screen' : 'Watch');
+  btn.disabled = pending;
+  btn.onclick = () => (pinned ? (viewing = ev.id, refresh()) : pin(ev));
+  meta.append(btn);
+  card.append(meta);
+  return card;
+}
+
+function scorerList(list, limit) {
+  const card = el('div', 'card');
+  if (!list.length) { card.append(el('p', 'muted', 'No fantasy points yet.')); return card; }
+  list.sort((a, b) => b.pts - a.pts).slice(0, limit).forEach((p, i) => {
+    const row = el('div', 'scorer');
+    const who = el('div', '', p.name);
+    who.append(el('small', '', `${p.team} · ${p.line.join(' · ')}`));
+    row.append(el('span', 'muted', String(i + 1)), img(p.img, ''), who, el('span', 'pts', p.pts.toFixed(1)));
+    card.append(row);
+  });
+  return card;
+}
+
+async function renderBoard() {
+  title.textContent = pinned ? 'Gridiron Live' : 'Gridiron Live · pick a game';
+  back.hidden = true;
+  const events = [...board.events].sort((a, b) => rank(a) - rank(b));
+  const frag = document.createDocumentFragment();
+  if (flashMsg) frag.append(el('p', 'err', flashMsg));
+  const live = events.filter(e => e.status.type.state === 'in');
+  frag.append(el('h2', '', `Live (${live.length})`));
+  if (!live.length) frag.append(el('p', 'muted', 'No games in progress right now.'));
+  live.forEach(e => frag.append(gameCard(e)));
+  frag.append(el('h2', '', `Top fantasy scorers · Week ${board.week?.number ?? ''} (PPR)`));
+  const started = events.filter(e => e.status.type.state !== 'pre');
+  const sums = await Promise.allSettled(started.map(e => summary(e.id, e.status.type.state === 'in' ? 60000 : 3600000)));
+  frag.append(scorerList(sums.flatMap(s => (s.status === 'fulfilled' ? fantasy(s.value.boxscore) : [])), 15));
+  const rest = events.filter(e => e.status.type.state !== 'in');
+  if (rest.length) frag.append(el('h2', '', 'All games'));
+  rest.forEach(e => frag.append(gameCard(e)));
+  main.replaceChildren(frag);
+}
+const rank = e => ({ in: 0, pre: 1, post: 2 })[e.status.type.state] ?? 3;
+
+async function renderGame(id) {
+  const d = await summary(id, 10000);
+  const comp = d.header.competitions[0], st = comp.status.type, live = st.state === 'in';
+  const teams = awayHome(comp.competitors);
+  title.textContent = teams.map(t => t.team.abbreviation).join(' @ ');
+  back.hidden = false;
+  const frag = document.createDocumentFragment();
+  if (flashMsg) frag.append(el('p', 'err', flashMsg));
+  const card = el('div', 'card');
+  const big = el('div', 'big');
+  teams.forEach((t, i) => {
+    const box = el('div', t.possession && live ? 'poss' : '');
+    box.append(img(t.team.logos?.[0]?.href || t.team.logo, t.team.abbreviation), el('div', '', t.team.abbreviation));
+    big.append(box, el('div', 'score', t.score ?? '0'));
+    if (i === 0) big.append(el('div', live ? 'live' : 'muted', live ? `● ${st.shortDetail}` : st.shortDetail));
+  });
+  card.append(big);
+  const sit = board?.events.find(e => e.id === id)?.competitions[0].situation;
+  if (live && sit?.downDistanceText) card.append(el('div', 'situation', `${sit.downDistanceText}${sit.isRedZone ? ' · RED ZONE' : ''}`));
+  if (sit?.lastPlay?.probability) {
+    const home = teams.find(t => t.homeAway === 'home');
+    card.append(el('div', 'meta', `Win probability: ${home.team.abbreviation} ${(sit.lastPlay.probability.homeWinPercentage * 100).toFixed(0)}%`));
+  }
+  frag.append(card);
+  const tabs = el('div', 'tabs');
+  for (const [k, label] of [['plays', 'Play-by-play'], ['scoring', 'Scoring'], ['fantasy', 'Top scorers']]) {
+    const b = el('button', '', label);
+    b.setAttribute('aria-pressed', String(tab === k));
+    b.onclick = () => { tab = k; render(); };
+    tabs.append(b);
+  }
+  frag.append(tabs);
+  if (tab === 'fantasy') { frag.append(el('h2', '', 'Fantasy points (PPR)')); frag.append(scorerList(fantasy(d.boxscore), 20)); }
+  else if (tab === 'scoring') {
+    const box = el('div', 'card');
+    const plays = d.scoringPlays || [];
+    if (!plays.length) box.append(el('p', 'muted', 'No scores yet.'));
+    [...plays].reverse().forEach(p => box.append(playRow(p, true)));
+    frag.append(el('h2', '', 'Scoring plays'), box);
+  } else {
+    const drives = [...(d.drives?.previous || []), ...(d.drives?.current ? [d.drives.current] : [])];
+    const seen = new Set();
+    const box = el('div', 'card');
+    if (!drives.length) box.append(el('p', 'muted', st.state === 'pre' ? `Kickoff: ${st.detail}` : 'No plays yet.'));
+    for (const dr of [...drives].reverse()) {
+      if (seen.has(dr.id)) continue; seen.add(dr.id);
+      box.append(el('div', 'drive', `${dr.team?.abbreviation ?? ''} · ${dr.description ?? ''}${dr.displayResult ? ' · ' + dr.displayResult : ''}`));
+      [...(dr.plays || [])].reverse().forEach(p => box.append(playRow(p, p.scoringPlay)));
+    }
+    frag.append(el('h2', '', live ? 'Live play-by-play' : 'Play-by-play'), box);
+  }
+  main.replaceChildren(frag);
+}
+
+function playRow(p, scoring) {
+  const row = el('div', 'play' + (scoring ? ' scoring' : ''));
+  row.append(el('div', 'clock', `Q${p.period?.number ?? ''} ${p.clock?.displayValue ?? ''}`));
+  const text = el('div', 'text', p.text || p.type?.text || '');
+  if (scoring && p.awayScore != null) text.append(el('div', 'muted', `${p.awayScore} – ${p.homeScore}`));
+  row.append(text);
+  return row;
+}
+
+/* ---------- loop ---------- */
+async function render() {
+  try {
+    if (!board) return;
+    if (viewing) await renderGame(viewing); else await renderBoard();
+  } catch (e) {
+    main.replaceChildren(el('p', 'err', `Couldn't load live data (${e.message}). Retrying…`));
+  }
+}
+async function refresh() {
+  clearTimeout(timer);
+  try { board = await getJSON(`${API}/scoreboard`); } catch (e) { if (!board) main.replaceChildren(el('p', 'err', `Scores unavailable (${e.message}). Retrying…`)); }
+  await render();
+  const anyLive = board?.events.some(e => e.status.type.state === 'in');
+  timer = setTimeout(refresh, anyLive ? 15000 : 120000);
+}
+back.onclick = () => { viewing = ''; tab = 'plays'; render(); };
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+refresh();
+</script>
+</body>
+</html>
